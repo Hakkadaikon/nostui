@@ -1,10 +1,6 @@
-use std::{fmt, string::ToString};
-
+use crossterm::event::KeyEvent;
 use nostr_sdk::prelude::*;
-use serde::{
-    de::{self, Deserializer, Visitor},
-    Deserialize, Serialize,
-};
+use serde::{Deserialize, Serialize};
 use strum::Display;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Display, Deserialize)]
@@ -18,14 +14,21 @@ pub enum Action {
     Refresh,
     Error(String),
     Help,
-    ReceiveEvent(nostr_sdk::Event),
+    ReceiveEvent(Event),
     ScrollUp,
     ScrollDown,
-    ScrollTop,
-    ScrollBottom,
+    ScrollToTop,
+    ScrollToBottom,
     React,
-    SendReaction(EventId),
+    SendReaction((EventId, XOnlyPublicKey)),
     Repost,
-    SendRepost(EventId),
+    SendRepost((EventId, XOnlyPublicKey)),
     Unselect,
+    NewTextNote,
+    ReplyTextNote,
+    SubmitTextNote,
+    SendTextNote(String, Vec<Tag>),
+    Key(KeyEvent),
+    MetadataUpdated(Metadata),
+    SystemMessage(String),
 }

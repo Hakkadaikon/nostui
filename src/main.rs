@@ -1,14 +1,13 @@
+#![deny(warnings)]
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 
 pub mod action;
 pub mod app;
 pub mod cli;
 pub mod components;
 pub mod config;
-pub mod conn;
 pub mod mode;
+pub mod nostr;
 pub mod text;
 pub mod tui;
 pub mod utils;
@@ -20,7 +19,7 @@ use color_eyre::eyre::Result;
 
 use crate::{
     app::App,
-    utils::{initialize_logging, initialize_panic_handler, version},
+    utils::{initialize_logging, initialize_panic_handler},
 };
 
 async fn tokio_main() -> Result<()> {

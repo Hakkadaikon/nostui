@@ -1,157 +1,150 @@
-use std::collections::hash_map::VacantEntry;
-use std::collections::VecDeque;
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    fmt::format,
-    time::Duration,
-};
+use std::cmp::Reverse;
+use std::collections::HashSet;
+use std::collections::{hash_map::Entry, HashMap};
 
-use chrono::{DateTime, Local};
 use color_eyre::eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent};
-use nostr_sdk::prelude::Event;
-use nostr_sdk::{EventId, Kind, Tag};
-use ratatui::{prelude::*, widgets::*};
-use serde::{Deserialize, Serialize};
+use nostr_sdk::prelude::*;
+use ratatui::{prelude::*, widgets, widgets::*};
+use sorted_vec::ReverseSortedSet;
 use tokio::sync::mpsc::UnboundedSender;
+use tui_textarea::TextArea;
+use tui_widget_list::List;
 
 use super::{Component, Frame};
+use crate::text::shorten_hex;
 use crate::{
     action::Action,
-    config::{Config, KeyBindings},
-    text,
-    widgets::shrink_text::ShrinkText,
+    config::Config,
+    nostr::{nip10::ReplyTagsBuilder, Profile, SortableEvent},
+    widgets::ScrollableList,
+    widgets::TextNote,
 };
 
 #[derive(Default)]
-pub struct Home {
+pub struct Home<'a> {
     command_tx: Option<UnboundedSender<Action>>,
     config: Config,
-    list_state: ListState,
-    events: VecDeque<Event>,
-    reactions: HashMap<EventId, Vec<Event>>,
-    reposts: HashMap<EventId, Vec<Event>>,
-    zap_receipts: HashMap<EventId, Vec<Event>>,
+    list_state: tui_widget_list::ListState,
+    notes: ReverseSortedSet<SortableEvent>,
+    profiles: HashMap<XOnlyPublicKey, Profile>,
+    reactions: HashMap<EventId, HashSet<Event>>,
+    reposts: HashMap<EventId, HashSet<Event>>,
+    zap_receipts: HashMap<EventId, HashSet<Event>>,
+    show_input: bool,
+    input: TextArea<'a>,
+    reply_to: Option<Event>,
 }
 
-impl Home {
+impl<'a> Home<'a> {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn format_pubkey(&self, pubkey: String) -> String {
-        let len = pubkey.len();
-        let heading = &pubkey[0..5];
-        let trail = &pubkey[(len - 5)..len];
-        format!("{}:{}", heading, trail)
     }
 
     fn find_last_event_tag(&self, ev: &Event) -> Option<Tag> {
         ev.tags
             .iter()
-            .filter(|tag| {
-                matches!(
-                    tag,
-                    Tag::Event {
-                        event_id,
-                        relay_url,
-                        marker
-                    }
-                )
-            })
+            .filter(|tag| matches!(tag, Tag::Event { .. }))
             .last()
             .cloned()
     }
 
-    fn find_amount(&self, ev: &Event) -> Option<Tag> {
-        ev.tags
-            .iter()
-            .filter(|tag| matches!(tag, Tag::Amount { millisats, bolt11 }))
-            .last()
-            .cloned()
+    fn add_note(&mut self, event: Event) {
+        let note = Reverse(SortableEvent::new(event));
+        self.notes.find_or_insert(note);
+
+        // Keep selected position
+        let selection = self.list_state.selected().map(|i| i + 1);
+        self.list_state.select(selection);
+    }
+
+    fn add_profile(&mut self, event: Event) {
+        if let Ok(metadata) = Metadata::from_json(event.content.clone()) {
+            let profile = Profile::new(event.pubkey, event.created_at, metadata);
+            if let Some(existing_profile) = self.profiles.get(&event.pubkey) {
+                if existing_profile.created_at > profile.created_at {
+                    return;
+                }
+            }
+
+            self.profiles.insert(event.pubkey, profile);
+        }
     }
 
     fn append_reaction(&mut self, reaction: Event) {
         // reactions grouped by event_id
-        if let Some(Tag::Event {
-            event_id,
-            relay_url,
-            marker,
-        }) = self.find_last_event_tag(&reaction)
-        {
-            if let Entry::Vacant(e) = self.reactions.entry(event_id) {
-                e.insert(vec![reaction]);
-            } else {
-                self.reactions
-                    .get_mut(&event_id)
-                    .expect("failed to get reactions")
-                    .push(reaction);
+        if let Some(Tag::Event { event_id, .. }) = self.find_last_event_tag(&reaction) {
+            match self.reactions.entry(event_id) {
+                Entry::Vacant(e) => {
+                    e.insert(HashSet::from([reaction]));
+                }
+                Entry::Occupied(mut e) => {
+                    e.get_mut().insert(reaction);
+                }
             }
         }
     }
 
     fn append_repost(&mut self, repost: Event) {
         // reposts grouped by event_id
-        if let Some(Tag::Event {
-            event_id,
-            relay_url,
-            marker,
-        }) = self.find_last_event_tag(&repost)
-        {
-            if let Entry::Vacant(e) = self.reposts.entry(event_id) {
-                e.insert(vec![repost]);
-            } else {
-                self.reposts
-                    .get_mut(&event_id)
-                    .expect("failed to get repost")
-                    .push(repost);
-            }
-        }
+        if let Some(Tag::Event { event_id, .. }) = self.find_last_event_tag(&repost) {
+            match self.reposts.entry(event_id) {
+                Entry::Vacant(e) => {
+                    e.insert(HashSet::from([repost]));
+                }
+                Entry::Occupied(mut e) => {
+                    e.get_mut().insert(repost);
+                }
+            };
+        };
     }
 
     fn append_zap_receipt(&mut self, zap_receipt: Event) {
         // zap receipts grouped by event_id
-        if let Some(Tag::Event {
-            event_id,
-            relay_url,
-            marker,
-        }) = self.find_last_event_tag(&zap_receipt)
-        {
-            if let Entry::Vacant(e) = self.zap_receipts.entry(event_id) {
-                e.insert(vec![zap_receipt]);
-            } else {
-                self.zap_receipts
-                    .get_mut(&event_id)
-                    .expect("failed to get zap_receipt")
-                    .push(zap_receipt);
+        if let Some(Tag::Event { event_id, .. }) = self.find_last_event_tag(&zap_receipt) {
+            match self.zap_receipts.entry(event_id) {
+                Entry::Vacant(e) => {
+                    e.insert(HashSet::from([zap_receipt]));
+                }
+                Entry::Occupied(mut e) => {
+                    e.get_mut().insert(zap_receipt);
+                }
             }
         }
     }
 
-    fn calc_reactions_count(&self, ev: &Event) -> usize {
-        self.reactions.get(&ev.id).unwrap_or(&vec![]).len()
+    fn text_note(&self, event: Event, area: Rect, padding: Padding) -> TextNote {
+        let default_reactions = HashSet::new();
+        let default_reposts = HashSet::new();
+        let default_zap_receipts = HashSet::new();
+        let profile = self.profiles.get(&event.pubkey);
+        let reactions = self.reactions.get(&event.id).unwrap_or(&default_reactions);
+        let reposts = self.reposts.get(&event.id).unwrap_or(&default_reposts);
+        let zap_receipts = self
+            .zap_receipts
+            .get(&event.id)
+            .unwrap_or(&default_zap_receipts);
+        TextNote::new(
+            event,
+            profile.cloned(),
+            reactions.clone(),
+            reposts.clone(),
+            zap_receipts.clone(),
+            area,
+            padding,
+        )
     }
 
-    fn calc_reposts_count(&self, ev: &Event) -> usize {
-        self.reposts.get(&ev.id).unwrap_or(&vec![]).len()
+    fn get_note(&self, i: usize) -> Option<&Event> {
+        self.notes.get(i).map(|note| &note.0.event)
     }
 
-    fn calc_zap_amount(&self, ev: &Event) -> u64 {
-        self.zap_receipts
-            .get(&ev.id)
-            .unwrap_or(&vec![])
-            .iter()
-            .fold(0, |acc, ev| {
-                if let Some(Tag::Amount { millisats, bolt11 }) = self.find_amount(ev) {
-                    acc + millisats
-                } else {
-                    acc
-                }
-            })
+    fn clear_input(&mut self) {
+        self.input.select_all();
+        self.input.delete_str(usize::MAX);
     }
 }
 
-impl Component for Home {
+impl<'a> Component for Home<'a> {
     fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> Result<()> {
         self.command_tx = Some(tx);
         Ok(())
@@ -165,58 +158,89 @@ impl Component for Home {
     fn update(&mut self, action: Action) -> Result<Option<Action>> {
         match action {
             Action::ReceiveEvent(ev) => match ev.kind {
-                Kind::TextNote => self.events.push_front(ev),
+                Kind::Metadata => self.add_profile(ev),
+                Kind::TextNote => self.add_note(ev),
                 Kind::Reaction => self.append_reaction(ev),
                 Kind::Repost => self.append_repost(ev), // TODO: show reposts on feed
                 Kind::ZapReceipt => self.append_zap_receipt(ev),
                 _ => {}
             },
             Action::ScrollUp => {
-                let selection = match self.list_state.selected() {
-                    _ if self.events.is_empty() => None,
-                    Some(i) if i > 1 => Some(i - 1),
-                    _ => Some(0),
-                };
-                self.list_state.select(selection);
+                if !self.show_input {
+                    self.scroll_up()
+                }
             }
             Action::ScrollDown => {
-                let selection = match self.list_state.selected() {
-                    _ if self.events.is_empty() => None,
-                    Some(i) if i < self.events.len() - 1 => Some(i + 1),
-                    Some(_) => Some(self.events.len() - 1),
-                    None if self.events.len() > 1 => Some(1),
-                    None => Some(0),
-                };
-                self.list_state.select(selection);
+                if !self.show_input {
+                    self.scroll_down()
+                }
             }
-            Action::ScrollTop => {
-                let selection = match self.list_state.selected() {
-                    _ if self.events.is_empty() => None,
-                    _ => Some(0),
-                };
-                self.list_state.select(selection);
+            Action::ScrollToTop => {
+                if !self.show_input {
+                    self.scroll_to_top()
+                }
             }
-            Action::ScrollBottom => {
-                let selection = match self.list_state.selected() {
-                    _ if self.events.is_empty() => None,
-                    _ => Some(self.events.len() - 1),
-                };
-                self.list_state.select(selection);
+            Action::ScrollToBottom => {
+                if !self.show_input {
+                    self.scroll_to_bottom()
+                }
             }
             Action::React => {
-                if let (Some(i), Some(tx)) = (self.list_state.selected(), &self.command_tx) {
-                    let event = self.events.get(i).expect("failed to get target event");
-                    tx.send(Action::SendReaction(event.id))?;
+                if let (false, Some(i), Some(tx)) = (
+                    self.show_input,
+                    self.list_state.selected(),
+                    &self.command_tx,
+                ) {
+                    let event = self.get_note(i).expect("failed to get target event");
+                    tx.send(Action::SendReaction((event.id, event.pubkey)))?;
                 }
             }
             Action::Repost => {
-                if let (Some(i), Some(tx)) = (self.list_state.selected(), &self.command_tx) {
-                    let event = self.events.get(i).expect("failed to get target event");
-                    tx.send(Action::SendRepost(event.id))?;
+                if let (false, Some(i), Some(tx)) = (
+                    self.show_input,
+                    self.list_state.selected(),
+                    &self.command_tx,
+                ) {
+                    let event = self.get_note(i).expect("failed to get target event");
+                    tx.send(Action::SendRepost((event.id, event.pubkey)))?;
                 }
             }
             Action::Unselect => {
                 self.list_state.select(None);
+                self.show_input = false;
+                self.reply_to = None;
+            }
+            Action::NewTextNote => {
+                self.reply_to = None;
+                self.show_input = true;
+            }
+            Action::ReplyTextNote => {
+                if let Some(i) = self.selected() {
+                    let selected = self.get_note(i).unwrap();
+                    self.reply_to = Some(selected.clone());
+                    self.show_input = true;
+                }
+            }
+            Action::SubmitTextNote => {
+                if let (true, Some(tx)) = (self.show_input, &self.command_tx) {
+                    let content = self.input.lines().join("\n");
+                    if !content.is_empty() {
+                        let tags = if let Some(ref reply_to) = self.reply_to {
+                            ReplyTagsBuilder::build(reply_to.clone())
+                        } else {
+                            vec![]
+                        };
+                        tx.send(Action::SendTextNote(content, tags))?;
+                        self.reply_to = None;
+                        self.show_input = false;
+                        self.clear_input();
+                    }
+                }
+            }
+            Action::Key(key) => {
+                if self.show_input {
+                    self.input.input(key);
+                }
             }
             _ => {}
         }
@@ -224,70 +248,64 @@ impl Component for Home {
     }
 
     fn draw(&mut self, f: &mut Frame<'_>, area: Rect) -> Result<()> {
-        let items: Vec<ListItem> = self
-            .events
+        let padding = Padding::new(1, 1, 1, 3);
+        let items: Vec<TextNote> = self
+            .notes
             .iter()
-            .map(|ev| {
-                let created_at = DateTime::from_timestamp(ev.created_at.as_i64(), 0)
-                    .expect("Invalid created_at")
-                    .with_timezone(&Local)
-                    .format("%H:%m:%d");
-                let reactions = self.calc_reactions_count(ev);
-                let reposts = self.calc_reposts_count(ev);
-                let zaps = self.calc_zap_amount(ev);
-                let content_width = area.width.saturating_sub(2); // NOTE: paddingを引いて調整している
-                let content_height = area.height.saturating_sub(7); // NOTE: paddingと他の行を引いて調整している
-                let content =
-                    ShrinkText::new(&ev.content, content_width as usize, content_height as usize);
-
-                let mut text = Text::default();
-                text.extend(Text::styled(
-                    self.format_pubkey(ev.pubkey.to_string()),
-                    Style::default().bold(),
-                ));
-                text.extend::<Text>(content.into());
-                text.extend(Text::styled(
-                    created_at.to_string(),
-                    Style::default().fg(Color::Gray),
-                ));
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("{}Likes", reactions),
-                        Style::default().fg(Color::LightRed),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{}Reposts", reposts),
-                        Style::default().fg(Color::LightGreen),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{}Sats", zaps / 1000),
-                        Style::default().fg(Color::LightYellow),
-                    ),
-                ]);
-                text.extend::<Text>(line.into());
-                text.extend(Text::styled(
-                    "─".repeat(area.width as usize),
-                    Style::default().fg(Color::Gray),
-                ));
-
-                ListItem::new(text)
-            })
+            .map(|ev| self.text_note(ev.0.event.clone(), area, padding))
             .collect();
 
-        let list = List::new(items.clone())
-            .block(
-                Block::default()
-                    .title("Timeline")
-                    .padding(Padding::new(1, 1, 1, 1)),
-            )
+        let list = List::new(items)
+            .block(widgets::Block::default().title("Timeline").padding(padding))
             .style(Style::default().fg(Color::White))
-            .highlight_style(Style::default().reversed())
-            .direction(ListDirection::TopToBottom);
+            .truncate(true);
 
         f.render_stateful_widget(list, area, &mut self.list_state);
 
+        if self.show_input {
+            let mut input_area = f.size();
+            input_area.height /= 2;
+            input_area.y = input_area.height;
+            input_area.height -= 2;
+            f.render_widget(Clear, input_area);
+
+            let block = if let Some(ref reply_to) = self.reply_to {
+                let name = if let Some(profile) = self.profiles.get(&reply_to.pubkey) {
+                    profile.name()
+                } else {
+                    shorten_hex(&reply_to.pubkey.to_string())
+                };
+
+                widgets::Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("Replying to {name}: Press ESC to close"))
+            } else {
+                widgets::Block::default()
+                    .borders(Borders::ALL)
+                    .title("New note: Press ESC to close")
+            };
+            self.input.set_block(block);
+            f.render_widget(self.input.widget(), input_area);
+        }
+
         Ok(())
+    }
+}
+
+impl<'a> ScrollableList<Event> for Home<'a> {
+    fn select(&mut self, index: Option<usize>) {
+        self.list_state.select(index);
+    }
+
+    fn selected(&self) -> Option<usize> {
+        self.list_state.selected()
+    }
+
+    fn len(&self) -> usize {
+        self.notes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.notes.is_empty()
     }
 }

@@ -2,15 +2,15 @@ use color_eyre::eyre::Result;
 use crossterm::event::KeyEvent;
 use nostr_sdk::prelude::*;
 use ratatui::prelude::Rect;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::{
     action::Action,
-    components::{fps::FpsCounter, home::Home, Component},
+    components::{Component, FpsCounter, Home, StatusBar},
     config::Config,
-    conn::Conn,
     mode::Mode,
+    nostr::Connection,
+    nostr::ConnectionProcess,
     tui,
 };
 
@@ -30,11 +30,13 @@ impl App {
         let home = Home::new();
         let fps = FpsCounter::default();
         let config = Config::new()?;
+        let pubkey = Keys::from_sk_str(config.privatekey.as_str())?.public_key();
+        let status_bar = StatusBar::new(pubkey, None, None, true);
         let mode = Mode::Home;
         Ok(Self {
             tick_rate,
             frame_rate,
-            components: vec![Box::new(home), Box::new(fps)],
+            components: vec![Box::new(home), Box::new(fps), Box::new(status_bar)],
             should_quit: false,
             should_suspend: false,
             config,
@@ -64,7 +66,10 @@ impl App {
             component.init(tui.size()?)?;
         }
 
-        let mut conn = Conn::new();
+        let keys = Keys::from_sk_str(&self.config.privatekey.clone())?;
+        let conn = Connection::new(keys.clone(), self.config.relays.clone()).await?;
+        let (mut req_rx, event_tx, terminate_tx, conn_wrapper) = ConnectionProcess::new(conn)?;
+        conn_wrapper.run();
 
         loop {
             if let Some(e) = tui.next().await {
@@ -74,6 +79,8 @@ impl App {
                     tui::Event::Render => action_tx.send(Action::Render)?,
                     tui::Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
                     tui::Event::Key(key) => {
+                        action_tx.send(Action::Key(key))?;
+
                         if let Some(keymap) = self.config.keybindings.get(&self.mode) {
                             if let Some(action) = keymap.get(&vec![key]) {
                                 log::info!("Got action: {action:?}");
@@ -100,7 +107,7 @@ impl App {
                 }
             }
 
-            while let Ok(event) = conn.recv() {
+            while let Ok(event) = req_rx.try_recv() {
                 action_tx.send(Action::ReceiveEvent(event))?;
             }
 
@@ -143,6 +150,27 @@ impl App {
                     Action::ReceiveEvent(ref event) => {
                         log::info!("Got nostr event: {event:?}");
                     }
+                    Action::SendReaction((id, pubkey)) => {
+                        let event = EventBuilder::reaction(id, pubkey, "+").to_event(&keys)?;
+                        log::info!("Send reaction: {event:?}");
+                        event_tx.send(event)?;
+                        let note1 = id.to_bech32()?;
+                        action_tx.send(Action::SystemMessage(format!("[Liked] {note1}")))?;
+                    }
+                    Action::SendRepost((id, pubkey)) => {
+                        let event = EventBuilder::repost(id, pubkey).to_event(&keys)?;
+                        log::info!("Send repost: {event:?}");
+                        event_tx.send(event)?;
+                        let note1 = id.to_bech32()?;
+                        action_tx.send(Action::SystemMessage(format!("[Reposted] {note1}")))?;
+                    }
+                    Action::SendTextNote(ref content, ref tags) => {
+                        let event = EventBuilder::text_note(content, tags.iter().cloned())
+                            .to_event(&keys)?;
+                        log::info!("Send text note: {event:?}");
+                        event_tx.send(event)?;
+                        action_tx.send(Action::SystemMessage(format!("[Posted] {content}")))?;
+                    }
                     _ => {}
                 }
                 for component in self.components.iter_mut() {
@@ -160,6 +188,7 @@ impl App {
                 // tui.mouse(true);
                 tui.enter()?;
             } else if self.should_quit {
+                terminate_tx.send(())?;
                 tui.stop()?;
                 break;
             }
